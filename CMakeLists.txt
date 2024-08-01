@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Add the path to the Hadoop include directory
 include_directories(/usr/local/libhdfs3/include/hdfs/)
+include_directories(/usr/local/folly/include/)
 
 # Add the path to the Hadoop library directory
 link_libraries(/usr/local/libhdfs3/lib/libhdfs3.so)

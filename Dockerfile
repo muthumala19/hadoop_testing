@@ -1,6 +1,5 @@
 FROM dependencies
 
-
 # Set up the working directory
 WORKDIR /app
 
