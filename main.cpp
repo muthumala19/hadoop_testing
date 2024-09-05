@@ -1,12 +1,14 @@
 #include <iostream>
 #include <hdfs.h>
 #include <sstream>
-#include <folly/ProducerConsumerQueue.h>
 #include <thread>
-#include <chrono> // For timing
+#include <chrono>
+#include <boost/lockfree/queue.hpp>
 
-constexpr int queueSize = 100; // Size of the ProducerConsumerQueue
-folly::ProducerConsumerQueue<std::string> queue(queueSize);
+constexpr int queueSize = 100; // Size of the Lockfree Queue
+const std::string hdfs_server = "10.8.100.246";
+const std::string hdfs_port = "9000";
+boost::lockfree::queue<std::string*> queue(queueSize);
 const std::string endOfStreamMessage = "__END_OF_STREAM__";
 
 void readLinesFromHDFS(hdfsFS fs, const std::string &filePath, std::chrono::duration<double>& readTime, int& edgeCount) {
@@ -43,7 +45,7 @@ void readLinesFromHDFS(hdfsFS fs, const std::string &filePath, std::chrono::dura
                 leftover = line;
             } else {
                 // Enqueue the complete line
-                while (!queue.write(line)) {
+                while (!queue.push(new std::string(line))) {
                     // Wait if the queue is full
                 }
                 edgeCount++;
@@ -53,14 +55,14 @@ void readLinesFromHDFS(hdfsFS fs, const std::string &filePath, std::chrono::dura
 
     // Handle any leftover data as a line if the file does not end with a newline
     if (!leftover.empty()) {
-        while (!queue.write(leftover)) {
+        while (!queue.push(new std::string(leftover))) {
             // Wait if the queue is full
         }
         edgeCount++;
     }
 
     // Signal the end of the stream
-    while (!queue.write(endOfStreamMessage)) {
+    while (!queue.push(new std::string(endOfStreamMessage))) {
         // Wait if the queue is full
     }
 
@@ -68,27 +70,25 @@ void readLinesFromHDFS(hdfsFS fs, const std::string &filePath, std::chrono::dura
     hdfsCloseFile(fs, file);
     std::cout << "Finished reading the file." << std::endl;
 
-    // End timing the reading process
     auto endTime = std::chrono::high_resolution_clock::now();
     readTime = endTime - startTime;
 }
 
 void processQueue(std::chrono::duration<double>& processTime) {
-    std::string line;
+    std::string* linePtr;
 
-    // Start timing the processing
     auto startTime = std::chrono::high_resolution_clock::now();
 
-
     while (true) {
-        while (!queue.read(line)) {
+        while (!queue.pop(linePtr)) {
             // Wait if the queue is empty
         }
-        if (line == endOfStreamMessage) {
+        std::unique_ptr<std::string> line(linePtr);
+        if (*line == endOfStreamMessage) {
             break; // Exit the loop if end of stream is reached
         }
         // Process the line
-//        std::cout << line << std::endl;
+        // std::cout << *line << std::endl;
     }
 
     // End timing the processing
@@ -109,19 +109,17 @@ int main() {
     }
 
     // Connect to HDFS
-    std::cout << "Connecting to HDFS server at 127.0.0.1:9000..." << std::endl;
-    hdfsFS fs = hdfsConnect("127.0.0.1", 9000);
+    std::cout << "Connecting to HDFS server "+hdfs_server+" on port "+hdfs_port+"..." << std::endl;
+    hdfsFS fs = hdfsConnect(hdfs_server.c_str(), std::stoi(hdfs_port));
     if (!fs) {
         std::cerr << "Failed to connect to HDFS" << std::endl;
         return 1;
     }
     std::cout << "Successfully connected to HDFS server." << std::endl;
 
-    // Variables to store the elapsed time and edge count
     std::chrono::duration<double> readTime, processTime;
     int edgeCount = 0;
 
-    // Start timing the total process
     auto totalStartTime = std::chrono::high_resolution_clock::now();
 
     // Start a thread to read the file line by line (Producer)
@@ -142,7 +140,6 @@ int main() {
     hdfsDisconnect(fs);
     std::cout << "Disconnected from HDFS server." << std::endl;
 
-    // Print the elapsed time and edge count
     std::cout << "Time taken for reading: " << readTime.count() << " seconds" << std::endl;
     std::cout << "Time taken for processing: " << processTime.count() << " seconds" << std::endl;
     std::cout << "Total time taken: " << totalTime.count() << " seconds" << std::endl;
