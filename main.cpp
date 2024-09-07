@@ -4,12 +4,24 @@
 #include <thread>
 #include <chrono>
 #include <boost/lockfree/queue.hpp>
+#include <vector>
+#include <mpi.h>
+#include <parmetis.h>
 
 constexpr int queueSize = 100; // Size of the Lockfree Queue
 const std::string hdfs_server = "10.8.100.246";
 const std::string hdfs_port = "9000";
 boost::lockfree::queue<std::string*> queue(queueSize);
 const std::string endOfStreamMessage = "__END_OF_STREAM__";
+
+struct Edge {
+    idx_t src;
+    idx_t dest;
+};
+
+std::vector<Edge> edges;
+std::vector<idx_t> xadj;
+std::vector<idx_t> adjncy;
 
 void readLinesFromHDFS(hdfsFS fs, const std::string &filePath, std::chrono::duration<double>& readTime, int& edgeCount) {
     const int bufferSize = 4096; // Size of the buffer for reading chunks
@@ -76,6 +88,7 @@ void readLinesFromHDFS(hdfsFS fs, const std::string &filePath, std::chrono::dura
 
 void processQueue(std::chrono::duration<double>& processTime) {
     std::string* linePtr;
+    std::istringstream iss;
 
     auto startTime = std::chrono::high_resolution_clock::now();
 
@@ -87,8 +100,14 @@ void processQueue(std::chrono::duration<double>& processTime) {
         if (*line == endOfStreamMessage) {
             break; // Exit the loop if end of stream is reached
         }
-        // Process the line
-        // std::cout << *line << std::endl;
+
+        // Process the line: parse source and destination vertices
+        iss.clear();
+        iss.str(*line);
+        Edge edge;
+        if (iss >> edge.src >> edge.dest) {
+            edges.push_back(edge);
+        }
     }
 
     // End timing the processing
@@ -96,26 +115,88 @@ void processQueue(std::chrono::duration<double>& processTime) {
     processTime = endTime - startTime;
 }
 
-int main() {
-    // Prompt the user for the file path
+void convertToCSR() {
+    std::vector<std::vector<idx_t>> adjList(edges.size());
+
+    for (const auto& edge : edges) {
+        adjList[edge.src].push_back(edge.dest);
+    }
+
+    xadj.push_back(0);
+    for (const auto& neighbors : adjList) {
+        adjncy.insert(adjncy.end(), neighbors.begin(), neighbors.end());
+        xadj.push_back(xadj.back() + neighbors.size());
+    }
+}
+
+void partitionGraph(int numParts) {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    idx_t nVertices = xadj.size() - 1;
+    idx_t ncon = 1;  // Number of constraints
+    idx_t nParts = numParts;
+
+    std::vector<real_t> tpwgts(ncon * nParts, 1.0 / nParts);
+    std::vector<real_t> ubvec(ncon, 1.05);  // 5% imbalance tolerance
+
+    idx_t options[METIS_NOPTIONS];
+    METIS_SetDefaultOptions(options);
+    options[METIS_OPTION_NUMBERING] = 0;
+
+    idx_t edgecut;
+    std::vector<idx_t> part(nVertices);
+
+    idx_t* vwgt = NULL;
+    idx_t* adjwgt = NULL;
+    idx_t wgtflag = 0;
+    idx_t numflag = 0;
+
+    MPI_Comm comm = MPI_COMM_WORLD;
+    int ret = ParMETIS_V3_PartKway(
+            xadj.data(), adjncy.data(), vwgt, adjwgt, &wgtflag, &numflag, &ncon,
+            &nVertices, &nParts, tpwgts.data(), ubvec.data(), options,
+            &edgecut, part.data(), &comm
+    );
+
+    if (ret != METIS_OK) {
+        std::cerr << "ParMETIS partitioning failed." << std::endl;
+    } else {
+        std::cout << "ParMETIS partitioning successful." << std::endl;
+        std::cout << "Edge cut: " << edgecut << std::endl;
+        // Here you can process or output the partitioning results
+        for (idx_t i = 0; i < nVertices; ++i) {
+            std::cout << "Vertex " << i << " assigned to partition " << part[i] << std::endl;
+        }
+    }
+}
+
+
+int main(int argc, char* argv[]) {
+    MPI_Init(&argc, &argv);
+
+    // Connect to HDFS
+    std::cout << "Connecting to HDFS server " << hdfs_server << " on port " << hdfs_port << "..." << std::endl;
+    hdfsFS fs = hdfsConnect(hdfs_server.c_str(), std::stoi(hdfs_port));
+    if (!fs) {
+        std::cerr << "Failed to connect to HDFS" << std::endl;
+        MPI_Finalize();
+        return 1;
+    }
+    std::cout << "Successfully connected to HDFS server." << std::endl;
+
+    // Prompt for file path
     std::string filePath;
     std::cout << "Enter the HDFS file path: ";
     std::getline(std::cin, filePath);
 
-    // Check if the user entered a path
     if (filePath.empty()) {
         std::cerr << "No file path provided. Exiting." << std::endl;
+        hdfsDisconnect(fs);
+        MPI_Finalize();
         return 1;
     }
-
-    // Connect to HDFS
-    std::cout << "Connecting to HDFS server "+hdfs_server+" on port "+hdfs_port+"..." << std::endl;
-    hdfsFS fs = hdfsConnect(hdfs_server.c_str(), std::stoi(hdfs_port));
-    if (!fs) {
-        std::cerr << "Failed to connect to HDFS" << std::endl;
-        return 1;
-    }
-    std::cout << "Successfully connected to HDFS server." << std::endl;
 
     std::chrono::duration<double> readTime, processTime;
     int edgeCount = 0;
@@ -132,6 +213,13 @@ int main() {
     producerThread.join();
     consumerThread.join();
 
+    // Convert the edge list to CSR format
+    convertToCSR();
+
+    // Partition the graph
+    int numParts = 4; // You can change this to the desired number of partitions
+    partitionGraph(numParts);
+
     // End timing the total process
     auto totalEndTime = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> totalTime = totalEndTime - totalStartTime;
@@ -145,5 +233,6 @@ int main() {
     std::cout << "Total time taken: " << totalTime.count() << " seconds" << std::endl;
     std::cout << "Total edges read: " << edgeCount << std::endl;
 
+    MPI_Finalize();
     return 0;
 }
