@@ -7,23 +7,33 @@
 #include <vector>
 #include <mpi.h>
 #include <parmetis.h>
+#include <set> // Include for std::set
 
 constexpr int queueSize = 100; // Size of the Lockfree Queue
-const std::string hdfs_server = "10.8.100.246";
+const std::string hdfs_server = "127.0.0.1";
 const std::string hdfs_port = "9000";
-boost::lockfree::queue<std::string*> queue(queueSize);
+boost::lockfree::queue<std::string *> queue(queueSize);
 const std::string endOfStreamMessage = "__END_OF_STREAM__";
 
 struct Edge {
     idx_t src;
     idx_t dest;
+
+    bool operator<(const Edge &other) const {
+        return std::tie(src, dest) < std::tie(other.src, other.dest);
+    }
 };
 
-std::vector<Edge> edges;
 std::vector<idx_t> xadj;
 std::vector<idx_t> adjncy;
 
-void readLinesFromHDFS(hdfsFS fs, const std::string &filePath, std::chrono::duration<double>& readTime, int& edgeCount) {
+std::set<idx_t> uniqueVertices;
+std::set<Edge> uniqueEdges;
+std::vector<std::pair<idx_t, std::vector<idx_t>>> adjacencyList;
+
+
+void
+readLinesFromHDFS(hdfsFS fs, const std::string &filePath, std::chrono::duration<double> &readTime, int &edgeCount) {
     const int bufferSize = 4096; // Size of the buffer for reading chunks
     char buffer[bufferSize];
 
@@ -86,8 +96,8 @@ void readLinesFromHDFS(hdfsFS fs, const std::string &filePath, std::chrono::dura
     readTime = endTime - startTime;
 }
 
-void processQueue(std::chrono::duration<double>& processTime) {
-    std::string* linePtr;
+void processQueue(std::chrono::duration<double> &processTime) {
+    std::string *linePtr;
     std::istringstream iss;
 
     auto startTime = std::chrono::high_resolution_clock::now();
@@ -106,7 +116,11 @@ void processQueue(std::chrono::duration<double>& processTime) {
         iss.str(*line);
         Edge edge;
         if (iss >> edge.src >> edge.dest) {
-            edges.push_back(edge);
+            // Add vertices to the set
+            uniqueVertices.insert(edge.src);
+            uniqueVertices.insert(edge.dest);
+            // Insert the edge into the set of unique edges
+            uniqueEdges.insert(edge);
         }
     }
 
@@ -116,48 +130,86 @@ void processQueue(std::chrono::duration<double>& processTime) {
 }
 
 void convertToCSR() {
-    std::vector<std::vector<idx_t>> adjList(edges.size());
+    std::cout << "CSR conversion started." << std::endl;
 
-    for (const auto& edge : edges) {
-        adjList[edge.src].push_back(edge.dest);
+    // Populate the adjacencyList vector
+    int verticesCount = uniqueVertices.size();
+    adjacencyList.resize(verticesCount);
+
+    for (const auto &edge: uniqueEdges) {
+        adjacencyList[edge.src].second.push_back(edge.dest);
     }
 
-    xadj.push_back(0);
-    for (const auto& neighbors : adjList) {
-        adjncy.insert(adjncy.end(), neighbors.begin(), neighbors.end());
-        xadj.push_back(xadj.back() + neighbors.size());
+    std::cout << "Adjacency list created with " << adjacencyList.size() << " vertices." << std::endl;
+
+    // Generate xadj and adjncy
+    xadj.resize(verticesCount + 1, 0); // Note: +1 for CSR format
+    adjncy.clear();
+
+    // Fill the xadj and adjncy vectors
+    for (int i = 0; i < verticesCount; i++) {
+        xadj[i + 1] = xadj[i] + adjacencyList[i].second.size(); // Correct CSR construction
+        adjncy.insert(adjncy.end(), adjacencyList[i].second.begin(),
+                      adjacencyList[i].second.end()); // Append all neighbors
     }
+
+    std::cout << "CSR conversion completed." << std::endl;
+
 }
 
 void partitionGraph(int numParts) {
+    std::cout << "Partition started with parmetis" << std::endl;
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    idx_t nVertices = xadj.size() - 1;
+    idx_t nVertices = uniqueVertices.size();  // Total number of vertices
     idx_t ncon = 1;  // Number of constraints
-    idx_t nParts = numParts;
+    idx_t nparts = numParts;  // Number of partitions should be of type idx_t
 
-    std::vector<real_t> tpwgts(ncon * nParts, 1.0 / nParts);
+    // Corrected type for tpwgts and ubvec
+    std::vector<real_t> tpwgts(ncon * nparts, 1.0 / nparts); // Weight distribution for partitions
     std::vector<real_t> ubvec(ncon, 1.05);  // 5% imbalance tolerance
 
     idx_t options[METIS_NOPTIONS];
     METIS_SetDefaultOptions(options);
-    options[METIS_OPTION_NUMBERING] = 0;
+    options[METIS_OPTION_NUMBERING] = 0;  // Start numbering from 0
 
     idx_t edgecut;
     std::vector<idx_t> part(nVertices);
 
-    idx_t* vwgt = NULL;
-    idx_t* adjwgt = NULL;
-    idx_t wgtflag = 0;
-    idx_t numflag = 0;
+    idx_t *vwgt = NULL;  // No vertex weights
+    idx_t *adjwgt = NULL;  // No edge weights
+    idx_t wgtflag = 0;  // No weights present
+    idx_t numflag = 0;  // C-style numbering
+
+    // Define vtxdist array to distribute vertices across processors
+    std::vector<idx_t> vtxdist(size + 1);  // vtxdist has size (number of processors + 1)
+    idx_t verticesPerProc = nVertices / size;
+    idx_t remainder = nVertices % size;
+
+    for (int i = 0; i < size; ++i) {
+        vtxdist[i] = i * verticesPerProc + std::min(static_cast<idx_t>(i), remainder);
+    }
+    vtxdist[size] = nVertices;  // Last element is the total number of vertices
 
     MPI_Comm comm = MPI_COMM_WORLD;
     int ret = ParMETIS_V3_PartKway(
-            xadj.data(), adjncy.data(), vwgt, adjwgt, &wgtflag, &numflag, &ncon,
-            &nVertices, &nParts, tpwgts.data(), ubvec.data(), options,
-            &edgecut, part.data(), &comm
+            vtxdist.data(),  // Distribution of vertices across processes
+            xadj.data(),     // Index of adjacency structure
+            adjncy.data(),   // Adjacency list data
+            vwgt,            // Vertex weights (NULL)
+            adjwgt,          // Edge weights (NULL)
+            &wgtflag,        // Indicates no weights
+            &numflag,        // C-style numbering
+            &ncon,           // Number of balancing constraints
+            &nparts,         // Corrected: Number of partitions
+            tpwgts.data(),   // Desired weight for each partition and constraint
+            ubvec.data(),    // Imbalance tolerance
+            options,         // Options array
+            &edgecut,        // Stores the edge-cut result
+            part.data(),     // Stores the partition assignment for each vertex
+            &comm            // Corrected: MPI communicator pointer
     );
 
     if (ret != METIS_OK) {
@@ -165,15 +217,10 @@ void partitionGraph(int numParts) {
     } else {
         std::cout << "ParMETIS partitioning successful." << std::endl;
         std::cout << "Edge cut: " << edgecut << std::endl;
-        // Here you can process or output the partitioning results
-        for (idx_t i = 0; i < nVertices; ++i) {
-            std::cout << "Vertex " << i << " assigned to partition " << part[i] << std::endl;
-        }
     }
 }
 
-
-int main(int argc, char* argv[]) {
+int main(int argc, char *argv[]) {
     MPI_Init(&argc, &argv);
 
     // Connect to HDFS
@@ -189,27 +236,26 @@ int main(int argc, char* argv[]) {
     // Prompt for file path
     std::string filePath;
     std::cout << "Enter the HDFS file path: ";
-    std::getline(std::cin, filePath);
+    std::cin >> filePath;
 
-    if (filePath.empty()) {
-        std::cerr << "No file path provided. Exiting." << std::endl;
+    // Check if file exists
+    hdfsFileInfo *fileInfo = hdfsGetPathInfo(fs, filePath.c_str());
+    if (!fileInfo) {
+        std::cerr << "File does not exist on HDFS: " << filePath << std::endl;
         hdfsDisconnect(fs);
         MPI_Finalize();
         return 1;
     }
+    hdfsFreeFileInfo(fileInfo, 1);
 
     std::chrono::duration<double> readTime, processTime;
     int edgeCount = 0;
 
     auto totalStartTime = std::chrono::high_resolution_clock::now();
 
-    // Start a thread to read the file line by line (Producer)
     std::thread producerThread(readLinesFromHDFS, fs, filePath, std::ref(readTime), std::ref(edgeCount));
-
-    // Start a thread to process the queue (Consumer)
     std::thread consumerThread(processQueue, std::ref(processTime));
 
-    // Join the producer and consumer threads
     producerThread.join();
     consumerThread.join();
 
@@ -231,7 +277,11 @@ int main(int argc, char* argv[]) {
     std::cout << "Time taken for reading: " << readTime.count() << " seconds" << std::endl;
     std::cout << "Time taken for processing: " << processTime.count() << " seconds" << std::endl;
     std::cout << "Total time taken: " << totalTime.count() << " seconds" << std::endl;
-    std::cout << "Total edges read: " << edgeCount << std::endl;
+    std::cout << "Total edges read: " << uniqueEdges.size() << std::endl;
+
+    // Print the number of unique vertices and edges
+    std::cout << "Number of unique vertices: " << uniqueVertices.size() << std::endl;
+    std::cout << "Number of unique edges: " << uniqueEdges.size() << std::endl;
 
     MPI_Finalize();
     return 0;
